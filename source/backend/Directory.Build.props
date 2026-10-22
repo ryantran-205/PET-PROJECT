@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <WarningsAsErrors>nullable</WarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <!-- CA1848/CA1873 (LoggerMessage), CA2007 (ConfigureAwait), CA1711, CA1716, CA1062, CA1305, CA1308, CA1031, CA2227, CA1819, CA1056, CA1054, CA1724: noisy for app code -->
+    <NoWarn>$(NoWarn);CA1848;CA1873;CA2007;CA1711;CA1716;CA1062;CA1305;CA1307;CA1308;CA1309;CA1310;CA1311;CA1304;CA1031;CA2227;CA1819;CA1056;CA1054;CA1724;CA1002;CA1034;CA1515;CA1812;CA1852;CA1861;CA1707;CA2201;CA1032;CA1064;CA1822;CA1859;CA1805;CA2234;CA1863;CA1050;CA1000;CA1720;CA5394;CA1024</NoWarn>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,127 @@
+# Brewline — local stack (development only).
+# Usage:  copy .env.example .env  →  fill placeholders  →  docker compose up -d --build
+# Data lives in named volumes; `docker compose down -v` DELETES local data (see README "Reset").
+name: brewline
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${SQL_SA_PASSWORD:?set SQL_SA_PASSWORD in .env}
+    ports:
+      - "${SQL_PORT:-14333}:1433"
+    volumes:
+      - sqldata:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-fnb}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_UI_PORT:-15672}:15672"
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # One-shot: applies EF Core migrations (and optional dev seed) then exits. API/Worker start after it succeeds.
+  migrator:
+    build:
+      context: ./source/backend
+      dockerfile: src/Fnb.Api/Dockerfile
+    command: ["--migrate-only"]
+    environment: &backend-env
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
+      ConnectionStrings__Sql: "Server=sqlserver,1433;Database=${SQL_DATABASE:-Fnb};User Id=sa;Password=${SQL_SA_PASSWORD};TrustServerCertificate=True;Encrypt=True"
+      ConnectionStrings__Redis: "redis:6379"
+      Messaging__Provider: RabbitMQ
+      Messaging__RabbitMq__ConnectionString: "amqp://${RABBITMQ_USER:-fnb}:${RABBITMQ_PASSWORD}@rabbitmq:5672/"
+      Jwt__SigningKey: ${JWT_SIGNING_KEY:?set JWT_SIGNING_KEY (>= 32 bytes) in .env}
+      Jwt__Issuer: ${JWT_ISSUER:-fnb-api}
+      Jwt__Audience: ${JWT_AUDIENCE:-fnb-clients}
+      Ordering__TrackingTokenSecret: ${TRACKING_TOKEN_SECRET:?set TRACKING_TOKEN_SECRET (>= 32 chars) in .env}
+      Ordering__PublicBaseUrl: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      Cors__AllowedOrigins__0: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      Seed__DevPassword: ${SEED_DEV_PASSWORD:-}
+      Hosting__EnableInProcessWorker: "false"
+      Database__MigrateOnStartup: "false"
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: ./source/backend
+      dockerfile: src/Fnb.Api/Dockerfile
+    environment: *backend-env
+    ports:
+      - "${API_PORT:-5080}:8080"
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      # aspnet base image has no curl; use bash /dev/tcp to probe the liveness endpoint.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health/live HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./source/backend
+      dockerfile: src/Fnb.Worker/Dockerfile
+    environment: *backend-env
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./source/frontend
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  sqldata:
+  redisdata:
+  rabbitdata:

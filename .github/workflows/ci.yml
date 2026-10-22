@@ -1,0 +1,147 @@
+# CI: build + test + package. Không chứa secret; không deploy.
+name: ci
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_VERSION: "10.0.x"      # khớp source/backend/global.json (10.0.100, rollForward latestFeature)
+  NODE_VERSION: "22.x"
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+
+jobs:
+  backend:
+    name: Backend (.NET)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: source/backend
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer
+          # Mật khẩu dùng một lần cho container CI tạm thời (không phải secret hệ thống).
+          MSSQL_SA_PASSWORD: ${{ secrets.CI_SQL_SA_PASSWORD || 'Ci_Only_Throwaway#2026' }}
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b -o /dev/null"
+          --health-interval 10s --health-timeout 5s --health-retries 20 --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: source/backend/global.json
+
+      - name: Restore
+        run: dotnet restore Fnb.sln
+
+      - name: Format (whitespace + style)
+        run: dotnet format Fnb.sln --verify-no-changes --no-restore --severity error
+
+      - name: Build
+        run: dotnet build Fnb.sln -c Release --no-restore
+
+      - name: Unit tests
+        run: >
+          dotnet test --project tests/Fnb.UnitTests -c Release --no-build
+          --report-trx --results-directory ${{ github.workspace }}/test-results/unit
+
+      - name: Integration tests (SQL Server service container)
+        env:
+          FNB_TEST_SQL: "Server=localhost,1433;User Id=sa;Password=${{ secrets.CI_SQL_SA_PASSWORD || 'Ci_Only_Throwaway#2026' }};TrustServerCertificate=True;Encrypt=True"
+        run: >
+          dotnet test --project tests/Fnb.IntegrationTests -c Release --no-build
+          --report-trx --results-directory ${{ github.workspace }}/test-results/integration
+
+      - name: Vulnerable packages
+        run: |
+          dotnet list Fnb.sln package --vulnerable --include-transitive | tee vulnerable.txt
+          if grep -qE "\b(High|Critical)\b" vulnerable.txt; then echo "::error::High/Critical vulnerable packages"; exit 1; fi
+
+      - name: Publish API & Worker
+        run: |
+          dotnet publish src/Fnb.Api -c Release --no-build -o ${{ github.workspace }}/out/api
+          dotnet publish src/Fnb.Worker -c Release --no-build -o ${{ github.workspace }}/out/worker
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results/
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-publish
+          path: out/
+          retention-days: 7
+
+  frontend:
+    name: Frontend (Vue)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: source/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: source/frontend/package-lock.json
+      - run: npm ci
+      - name: Typecheck (lint gate)
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: npm audit (production deps)
+        run: npm audit --omit=dev --audit-level=high
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: source/frontend/dist/
+          retention-days: 7
+
+  images:
+    name: Container images (build only)
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: source/backend
+          file: source/backend/src/Fnb.Api/Dockerfile
+          push: false
+          tags: fnb-api:ci-${{ github.sha }}
+      - name: Build Worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: source/backend
+          file: source/backend/src/Fnb.Worker/Dockerfile
+          push: false
+          tags: fnb-worker:ci-${{ github.sha }}
+      - name: Build Frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: source/frontend
+          push: false
+          tags: fnb-web:ci-${{ github.sha }}
+      - name: Validate Bicep
+        run: az bicep build --file infra/main.bicep --stdout > /dev/null

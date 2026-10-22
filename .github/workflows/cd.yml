@@ -1,0 +1,115 @@
+# CD: CHỈ chạy thủ công (workflow_dispatch). Production luôn qua GitHub Environment approval.
+# Yêu cầu cấu hình trước (KHÔNG có trong repo):
+#   - GitHub Environments: development, staging, production (production có required reviewers).
+#   - Federated credential (OIDC) cho App Registration/Managed Identity; biến môi trường (vars):
+#       AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP,
+#       ACR_NAME, NAME_PREFIX, API_HEALTH_URL
+# Xem docs/deployment.md.
+name: cd
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Môi trường đích"
+        required: true
+        type: choice
+        options: [development, staging, production]
+      run_migrations:
+        description: "Chạy migration (expand-only, đã review) trước khi cập nhật app"
+        type: boolean
+        default: false
+      what_if_only:
+        description: "Chỉ chạy Bicep what-if, không thay đổi hạ tầng/app"
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+concurrency:
+  group: cd-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  build-push:
+    name: Build & push images
+    if: ${{ !inputs.what_if_only }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Build & push (ACR build, không cần docker login secret)
+        run: |
+          az acr build -r "${{ vars.ACR_NAME }}" -t "fnb-api:${{ steps.meta.outputs.tag }}" -f source/backend/src/Fnb.Api/Dockerfile source/backend
+          az acr build -r "${{ vars.ACR_NAME }}" -t "fnb-worker:${{ steps.meta.outputs.tag }}" -f source/backend/src/Fnb.Worker/Dockerfile source/backend
+          az acr build -r "${{ vars.ACR_NAME }}" -t "fnb-web:${{ steps.meta.outputs.tag }}" source/frontend
+
+  infra:
+    name: Bicep ${{ inputs.what_if_only && 'what-if' || 'deploy' }}
+    needs: [build-push]
+    if: ${{ always() && (needs.build-push.result == 'success' || needs.build-push.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: What-if
+        run: |
+          az deployment group what-if -g "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            -f infra/main.bicep \
+            -p environmentName=${{ inputs.environment }} namePrefix=${{ vars.NAME_PREFIX }} \
+               imageTag=${{ needs.build-push.outputs.tag || 'latest' }}
+      - name: Deploy
+        if: ${{ !inputs.what_if_only }}
+        run: |
+          az deployment group create -g "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            -f infra/main.bicep -n "fnb-${{ github.run_id }}" \
+            -p environmentName=${{ inputs.environment }} namePrefix=${{ vars.NAME_PREFIX }} \
+               imageTag=${{ needs.build-push.outputs.tag }}
+
+  migrate:
+    name: Database migration (controlled)
+    needs: [infra]
+    if: ${{ !inputs.what_if_only && inputs.run_migrations }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Run migration job (Container Apps Job, managed identity → Azure SQL)
+        run: |
+          az containerapp job start -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "${{ vars.NAME_PREFIX }}-${{ inputs.environment }}-migrate"
+          echo "Theo dõi execution trong Azure Portal / az containerapp job execution list."
+
+  verify:
+    name: Health check
+    needs: [infra, migrate]
+    if: ${{ always() && !inputs.what_if_only && needs.infra.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Probe /health/ready
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${{ vars.API_HEALTH_URL }}/health/ready" || true)
+            echo "attempt $i → $code"; [ "$code" = "200" ] && exit 0; sleep 10
+          done
+          echo "::error::Health check thất bại — xem docs/runbook.md mục Rollback"; exit 1

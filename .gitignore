@@ -1,0 +1,36 @@
+# Secrets / local env
+.env
+*.env.local
+appsettings.*.local.json
+secrets.json
+
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+TestResults/
+*.trx
+coverage*/
+
+# Node / Vite
+node_modules/
+dist/
+*.log
+.vite/
+
+# Local databases / exports
+*.mdf
+*.ldf
+*.bak
+exports/
+*.csv
+!**/fixtures/*.csv
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

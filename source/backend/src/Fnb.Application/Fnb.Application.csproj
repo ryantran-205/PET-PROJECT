@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\Fnb.Domain\Fnb.Domain.csproj" />
+    <ProjectReference Include="..\Fnb.Contracts\Fnb.Contracts.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
+    <PackageReference Include="Microsoft.Extensions.Identity.Core" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Fnb.UnitTests" />
+    <InternalsVisibleTo Include="Fnb.IntegrationTests" />
+  </ItemGroup>
+</Project>
